@@ -1,4 +1,4 @@
-use pdf_extract::extract_text;
+use lopdf::Document;
 use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::panic;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -166,7 +164,7 @@ fn process_paper(paper: &Paper, papers_dir: &PathBuf, summary_dir: &PathBuf, ope
     }
 
     println!("  Extracting text from PDF: {}", paper.title);
-    let pdf_text = match extract_text_silent(&pdf_path) {
+    let pdf_text = match extract_text_from_pdf(&pdf_path) {
         Ok(text) => {
             if text.trim().is_empty() {
                 println!("  PDF text extraction returned empty content: {}", paper.title);
@@ -327,39 +325,23 @@ fn fetch_arxiv_papers(client: &Client) -> Vec<Paper> {
     all_papers
 }
 
-fn extract_text_silent(path: &Path) -> Result<String, String> {
-    let path_buf = path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
+fn extract_text_from_pdf(path: &Path) -> Result<String, String> {
+    let doc = Document::load(path).map_err(|e| e.to_string())?;
+    let mut text = String::new();
 
-    thread::spawn(move || {
-        unsafe {
-            let dev_null = fs::File::open("/dev/null").unwrap();
-            let dev_null_fd = dev_null.as_raw_fd();
-            let stdout_fd = libc::dup(1);
-            let stderr_fd = libc::dup(2);
-            libc::dup2(dev_null_fd, 1);
-            libc::dup2(dev_null_fd, 2);
-            drop(dev_null);
-
-            panic::set_hook(Box::new(|_| {}));
-            let result = panic::catch_unwind(|| extract_text(&path_buf));
-            let _ = panic::take_hook();
-
-            libc::dup2(stdout_fd, 1);
-            libc::dup2(stderr_fd, 2);
-            libc::close(stdout_fd);
-            libc::close(stderr_fd);
-
-            let _ = tx.send(result);
+    let pages: Vec<_> = doc.get_pages().keys().cloned().collect();
+    for page_id in pages {
+        if let Ok(content) = doc.extract_text(&[page_id]) {
+            text.push_str(&content);
+            text.push('\n');
         }
-    });
-
-    match rx.recv_timeout(Duration::from_secs(120)) {
-        Ok(Ok(Ok(text))) => Ok(text),
-        Ok(Ok(Err(e))) => Err(e.to_string()),
-        Ok(Err(_)) => Err("PDF extraction panicked".to_string()),
-        Err(_) => Err("PDF extraction timed out".to_string()),
     }
+
+    if text.trim().is_empty() {
+        return Err("No text extracted from PDF".to_string());
+    }
+
+    Ok(text)
 }
 
 fn download_pdf(client: &Client, url: &str, path: &Path) -> Result<(), String> {
