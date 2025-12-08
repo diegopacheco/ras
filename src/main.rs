@@ -6,11 +6,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::panic;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use once_cell::sync::Lazy;
+
+static SANITIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[<>:"/\\|?*\x00-\x1f]"#).unwrap());
+static ID_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"/abs/(\d+\.\d+)").unwrap());
 
 #[derive(Debug, Clone)]
 struct Paper {
@@ -98,6 +103,7 @@ fn main() {
     let openai_key = Arc::new(std::env::var("OPEN_AI_API_KEY").expect("OPEN_AI_API_KEY environment variable not set"));
     let papers_dir = Arc::new(papers_dir);
     let summary_dir = Arc::new(summary_dir);
+    let client = Arc::new(client);
 
     let chunks: Vec<Vec<Paper>> = papers_to_process
         .chunks(10)
@@ -114,9 +120,10 @@ fn main() {
             let openai_key = Arc::clone(&openai_key);
             let papers_dir = Arc::clone(&papers_dir);
             let summary_dir = Arc::clone(&summary_dir);
+            let client = Arc::clone(&client);
 
             let handle = thread::spawn(move || {
-                process_paper(&paper, &papers_dir, &summary_dir, &openai_key)
+                process_paper(&paper, &papers_dir, &summary_dir, &openai_key, &client)
             });
             handles.push(handle);
         }
@@ -131,14 +138,8 @@ fn main() {
     println!("\nDone!");
 }
 
-fn process_paper(paper: &Paper, papers_dir: &PathBuf, summary_dir: &PathBuf, openai_key: &str) {
+fn process_paper(paper: &Paper, papers_dir: &PathBuf, summary_dir: &PathBuf, openai_key: &str, client: &Client) {
     println!("Processing: {}", paper.title);
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .build()
-        .expect("Failed to create HTTP client");
 
     let pdf_filename = format!("{}.pdf", sanitize_filename(&paper.title));
     let pdf_path = papers_dir.join(&pdf_filename);
@@ -156,9 +157,23 @@ fn process_paper(paper: &Paper, papers_dir: &PathBuf, summary_dir: &PathBuf, ope
         println!("  PDF already exists: {}", pdf_filename);
     }
 
+    if let Ok(metadata) = fs::metadata(&pdf_path) {
+        if metadata.len() < 1000 {
+            println!("  PDF file too small, likely corrupted: {}", pdf_filename);
+            let _ = fs::remove_file(&pdf_path);
+            return;
+        }
+    }
+
     println!("  Extracting text from PDF: {}", paper.title);
     let pdf_text = match extract_text_silent(&pdf_path) {
-        Ok(text) => text,
+        Ok(text) => {
+            if text.trim().is_empty() {
+                println!("  PDF text extraction returned empty content: {}", paper.title);
+                return;
+            }
+            text
+        },
         Err(e) => {
             println!("  Failed to extract PDF text: {}", e);
             return;
@@ -195,11 +210,10 @@ fn get_existing_summaries(summary_dir: &Path) -> HashSet<String> {
 }
 
 fn sanitize_filename(name: &str) -> String {
-    let re = Regex::new(r#"[<>:"/\\|?*\x00-\x1f]"#).unwrap();
-    let sanitized = re.replace_all(name, "_").to_string();
+    let sanitized = SANITIZE_REGEX.replace_all(name, "_").to_string();
     let sanitized = sanitized.trim().to_string();
-    if sanitized.len() > 200 {
-        sanitized[..200].to_string()
+    if sanitized.chars().count() > 200 {
+        sanitized.chars().take(200).collect()
     } else {
         sanitized
     }
@@ -221,8 +235,6 @@ fn fetch_arxiv_papers(client: &Client) -> Vec<Paper> {
     let dts: Vec<_> = document.select(&dt_selector).collect();
     let dds: Vec<_> = document.select(&dd_selector).collect();
 
-    let id_regex = Regex::new(r"/abs/(\d+\.\d+)").unwrap();
-
     for (dt, dd) in dts.iter().zip(dds.iter()) {
         if all_papers.len() >= 100 {
             break;
@@ -231,7 +243,7 @@ fn fetch_arxiv_papers(client: &Client) -> Vec<Paper> {
         let mut paper_id = String::new();
         for a in dt.select(&a_selector) {
             if let Some(href) = a.value().attr("href") {
-                if let Some(caps) = id_regex.captures(href) {
+                if let Some(caps) = ID_REGEX.captures(href) {
                     paper_id = caps.get(1).unwrap().as_str().to_string();
                     break;
                 }
@@ -276,7 +288,7 @@ fn fetch_arxiv_papers(client: &Client) -> Vec<Paper> {
                     let mut paper_id = String::new();
                     for a in dt.select(&a_selector) {
                         if let Some(href) = a.value().attr("href") {
-                            if let Some(caps) = id_regex.captures(href) {
+                            if let Some(caps) = ID_REGEX.captures(href) {
                                 paper_id = caps.get(1).unwrap().as_str().to_string();
                                 break;
                             }
@@ -315,20 +327,38 @@ fn fetch_arxiv_papers(client: &Client) -> Vec<Paper> {
     all_papers
 }
 
-fn extract_text_silent(path: &Path) -> Result<String, pdf_extract::OutputError> {
-    unsafe {
-        let dev_null = fs::File::open("/dev/null").unwrap();
-        let dev_null_fd = dev_null.as_raw_fd();
-        let stdout_fd = libc::dup(1);
-        let stderr_fd = libc::dup(2);
-        libc::dup2(dev_null_fd, 1);
-        libc::dup2(dev_null_fd, 2);
-        let result = extract_text(path);
-        libc::dup2(stdout_fd, 1);
-        libc::dup2(stderr_fd, 2);
-        libc::close(stdout_fd);
-        libc::close(stderr_fd);
-        result
+fn extract_text_silent(path: &Path) -> Result<String, String> {
+    let path_buf = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    thread::spawn(move || {
+        unsafe {
+            let dev_null = fs::File::open("/dev/null").unwrap();
+            let dev_null_fd = dev_null.as_raw_fd();
+            let stdout_fd = libc::dup(1);
+            let stderr_fd = libc::dup(2);
+            libc::dup2(dev_null_fd, 1);
+            libc::dup2(dev_null_fd, 2);
+            drop(dev_null);
+
+            panic::set_hook(Box::new(|_| {}));
+            let result = panic::catch_unwind(|| extract_text(&path_buf));
+            let _ = panic::take_hook();
+
+            libc::dup2(stdout_fd, 1);
+            libc::dup2(stderr_fd, 2);
+            libc::close(stdout_fd);
+            libc::close(stderr_fd);
+
+            let _ = tx.send(result);
+        }
+    });
+
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(Ok(text))) => Ok(text),
+        Ok(Ok(Err(e))) => Err(e.to_string()),
+        Ok(Err(_)) => Err("PDF extraction panicked".to_string()),
+        Err(_) => Err("PDF extraction timed out".to_string()),
     }
 }
 
@@ -341,10 +371,10 @@ fn download_pdf(client: &Client, url: &str, path: &Path) -> Result<(), String> {
 }
 
 fn generate_summary(client: &Client, api_key: &str, paper: &Paper, pdf_text: &str) -> Result<String, String> {
-    let truncated_text = if pdf_text.len() > 50000 {
-        &pdf_text[..50000]
+    let truncated_text: String = if pdf_text.chars().count() > 50000 {
+        pdf_text.chars().take(50000).collect()
     } else {
-        pdf_text
+        pdf_text.to_string()
     };
 
     let prompt = format!(
@@ -363,7 +393,7 @@ fn generate_summary(client: &Client, api_key: &str, paper: &Paper, pdf_text: &st
         4. **Critical Insights**: Discuss the nuances, limitations, or specific behaviors observed in the study. Look for failure modes (e.g., hallucinations), performance gaps between domains, or qualitative observations made by the authors.
 
         **Constraint:** Do not hallucinate. Base the summary *strictly* on the provided text context."#,
-        paper.title, paper.id, paper.pdf_url, truncated_text
+        paper.title, paper.id, paper.pdf_url, &truncated_text
     );
 
     let request = OpenAIRequest {
@@ -375,33 +405,64 @@ fn generate_summary(client: &Client, api_key: &str, paper: &Paper, pdf_text: &st
         max_completion_tokens: 2000,
     };
 
-    let response = client
-        .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&request)
-        .send()
-        .map_err(|e| e.to_string())?;
+    let max_retries = 3;
+    let mut last_error = String::new();
 
-    let status = response.status();
-    let body = response.text().map_err(|e| e.to_string())?;
+    for attempt in 0..max_retries {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
+        }
 
-    if !status.is_success() {
-        return Err(format!("API error {}: {}", status, body));
+        let response = match client
+            .post("https://api.openai.com/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = e.to_string();
+                    continue;
+                }
+            };
+
+        let status = response.status();
+        let body = match response.text() {
+            Ok(b) => b,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+
+        if status.as_u16() == 429 || status.as_u16() >= 500 {
+            last_error = format!("API error {}: {}", status, body);
+            continue;
+        }
+
+        if !status.is_success() {
+            return Err(format!("API error {}: {}", status, body));
+        }
+
+        let api_response: OpenAIResponse = match serde_json::from_str(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("Parse error: {} - Body: {}", e, body);
+                continue;
+            }
+        };
+
+        if api_response.choices.is_empty() {
+            return Err("No response from API".to_string());
+        }
+
+        let summary_content = &api_response.choices[0].message.content;
+        let full_summary = format!(
+            "# {}\n\n**arXiv ID**: {}\n**PDF**: {}\n\n---\n\n{}",
+            paper.title, paper.id, paper.pdf_url, summary_content
+        );
+        return Ok(full_summary);
     }
 
-    let api_response: OpenAIResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {} - Body: {}", e, body))?;
-
-    if api_response.choices.is_empty() {
-        return Err("No response from API".to_string());
-    }
-
-    let summary_content = &api_response.choices[0].message.content;
-
-    let full_summary = format!(
-        "# {}\n\n**arXiv ID**: {}\n**PDF**: {}\n\n---\n\n{}",
-        paper.title, paper.id, paper.pdf_url, summary_content
-    );
-
-    Ok(full_summary)
+    Err(format!("Failed after {} retries: {}", max_retries, last_error))
 }
