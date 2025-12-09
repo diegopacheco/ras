@@ -168,12 +168,14 @@ fn process_paper(paper: &Paper, papers_dir: &PathBuf, summary_dir: &PathBuf, ope
         Ok(text) => {
             if text.trim().is_empty() {
                 println!("  PDF text extraction returned empty content: {}", paper.title);
+                save_error_summary(summary_dir, paper, "PDF text extraction returned empty content");
                 return;
             }
             text
         },
         Err(e) => {
             println!("  Failed to extract PDF text: {}", e);
+            save_error_summary(summary_dir, paper, &e);
             return;
         }
     };
@@ -188,8 +190,20 @@ fn process_paper(paper: &Paper, papers_dir: &PathBuf, summary_dir: &PathBuf, ope
         }
         Err(e) => {
             println!("  Failed to generate summary: {}", e);
+            save_error_summary(summary_dir, paper, &e);
         }
     }
+}
+
+fn save_error_summary(summary_dir: &PathBuf, paper: &Paper, error: &str) {
+    let summary_filename = format!("{}-summary.md", sanitize_filename(&paper.title));
+    let summary_path = summary_dir.join(&summary_filename);
+    let content = format!(
+        "# {}\n\n**arXiv ID**: {}\n**PDF**: {}\n\n---\n\n## Error\n\nFailed to process this paper.\n\n**Error**: {}\n\nPlease review manually.",
+        paper.title, paper.id, paper.pdf_url, error
+    );
+    let _ = fs::write(&summary_path, content);
+    println!("  Error summary saved: {}", summary_filename);
 }
 
 fn get_existing_summaries(summary_dir: &Path) -> HashSet<String> {
@@ -209,6 +223,7 @@ fn get_existing_summaries(summary_dir: &Path) -> HashSet<String> {
 
 fn sanitize_filename(name: &str) -> String {
     let sanitized = SANITIZE_REGEX.replace_all(name, "_").to_string();
+    let sanitized = sanitized.replace(' ', "_");
     let sanitized = sanitized.trim().to_string();
     if sanitized.chars().count() > 200 {
         sanitized.chars().take(200).collect()
@@ -353,8 +368,8 @@ fn download_pdf(client: &Client, url: &str, path: &Path) -> Result<(), String> {
 }
 
 fn generate_summary(client: &Client, api_key: &str, paper: &Paper, pdf_text: &str) -> Result<String, String> {
-    let truncated_text: String = if pdf_text.chars().count() > 50000 {
-        pdf_text.chars().take(50000).collect()
+    let truncated_text: String = if pdf_text.chars().count() > 100000 {
+        pdf_text.chars().take(100000).collect()
     } else {
         pdf_text.to_string()
     };
